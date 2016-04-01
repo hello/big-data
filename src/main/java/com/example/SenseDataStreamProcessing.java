@@ -7,6 +7,7 @@ import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionIn
 import com.hello.suripu.api.input.DataInputProtos;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.function.FlatMapFunction;
+import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.streaming.Duration;
@@ -19,7 +20,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Tuple2;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * Created by ksg on 3/24/16
@@ -35,14 +38,6 @@ public class SenseDataStreamProcessing {
 
 
     public static void main(String[] args) {
-
-//        String workerId;
-//        try {
-//            workerId = InetAddress.getLocalHost().getCanonicalHostName();
-//        } catch (UnknownHostException e) {
-//            e.printStackTrace();
-//            workerId = "localhost";
-//        }
 
         final AmazonKinesisClient kinesisClient = new AmazonKinesisClient(new DefaultAWSCredentialsProviderChain());
         kinesisClient.setEndpoint(KINESIS_ENDPOINT);
@@ -61,78 +56,78 @@ public class SenseDataStreamProcessing {
 
 
         // set up Spark Context
-        final SparkConf sparkConfig = new SparkConf().setMaster("local[4]").setAppName(STREAMING_APP_NAME);
-        final JavaStreamingContext jssc = new JavaStreamingContext(sparkConfig, batchInterval);
+        SparkConf sparkConfig = new SparkConf().setMaster("local[4]").setAppName(STREAMING_APP_NAME);
+        JavaStreamingContext jssc = new JavaStreamingContext(sparkConfig, batchInterval);
 
         // Create Kinesis DStreams
-//        final List<JavaDStream<byte[]>> streamsList = new ArrayList<JavaDStream<byte[]>>(numStreams);
-//        for (int i = 0; i < numStreams; i++) {
-//            streamsList.add(
-//                    KinesisUtils.createStream(jssc, KINESIS_APP_NAME, KINESIS_STREAM_NAME, KINESIS_ENDPOINT, regionName,
-//                            InitialPositionInStream.LATEST,
-//                            kinesisCheckpointInterval,
-//                            StorageLevel.MEMORY_AND_DISK_2())
-//            );
-//        }
-//
-//        // union the streams
-//        final JavaDStream<byte[]> unionStreams;
-//        if (streamsList.size() > 1) {
-//            unionStreams = jssc.union(streamsList.get(0), streamsList.subList(1, streamsList.size()));
-//        } else {
-//            unionStreams = streamsList.get(0);
-//        }
+        final List<JavaDStream<byte[]>> streamsList = new ArrayList<>(numStreams);
+        for (int i = 0; i < numStreams; i++) {
+            streamsList.add(
+                    KinesisUtils.createStream(jssc, KINESIS_APP_NAME, KINESIS_STREAM_NAME, KINESIS_ENDPOINT, regionName,
+                            InitialPositionInStream.LATEST,
+                            kinesisCheckpointInterval,
+                            StorageLevel.MEMORY_AND_DISK_2())
+            );
+        }
 
-        JavaDStream<byte[]> unionStreams =  KinesisUtils.createStream(
-                jssc, KINESIS_APP_NAME, KINESIS_STREAM_NAME, KINESIS_ENDPOINT, regionName,
-                InitialPositionInStream.LATEST,
-                kinesisCheckpointInterval,
-                StorageLevel.MEMORY_AND_DISK_2());
+        // union the streams
+        final JavaDStream<byte[]> unionStreams;
+        if (streamsList.size() > 1) {
+            unionStreams = jssc.union(streamsList.get(0), streamsList.subList(1, streamsList.size()));
+        } else {
+            unionStreams = streamsList.get(0);
+        }
 
         // convert each stream to DataInputProtos.BatchPeriodicDataWorker
-        final JavaDStream<String> batchData = unionStreams.flatMap(
-                new FlatMapFunction<byte[], String>() {
+        JavaDStream<DataInputProtos.BatchPeriodicDataWorker> batchData = unionStreams.flatMap(
+                new FlatMapFunction<byte[], DataInputProtos.BatchPeriodicDataWorker>() {
                     @Override
-                    public Iterable<String> call(byte[] bytes) throws Exception {
+                    public Iterable< DataInputProtos.BatchPeriodicDataWorker> call(byte[] bytes) throws Exception {
                         final DataInputProtos.BatchPeriodicDataWorker data = DataInputProtos.BatchPeriodicDataWorker.parseFrom(bytes);
-                        LOGGER.debug("grab device {} ts {}", data.getData().getDeviceId(), data.getReceivedAt());
-                        return Arrays.asList(data.getData().getDeviceId());
+                        LOGGER.info("grab device {} ts {}", data.getData().getDeviceId(), data.getReceivedAt());
+                        return Arrays.asList(data);
                     }
                 }
         );
 
         // count FWs
         JavaPairDStream<String, Integer> fwCounts = batchData.mapToPair(
-                new PairFunction<String, String, Integer>() {
+                new PairFunction< DataInputProtos.BatchPeriodicDataWorker, String, Integer>() {
                     @Override
-                    public Tuple2<String, Integer> call(String string) throws Exception {
-                        return new Tuple2<String, Integer>(string, 1);
+                    public Tuple2<String, Integer> call( DataInputProtos.BatchPeriodicDataWorker data) throws Exception {
+                        return new Tuple2<>(data.getFirmwareTopVersion(), 1);
                     }
                 }
 
+        ).reduceByKey(
+                new Function2<Integer, Integer, Integer>() {
+                    @Override
+                    public Integer call(Integer i1, Integer i2) throws Exception {
+                        return i1 + i2;
+                    }
+                }
         );
+
+        // sum uptime per FW version
+        JavaPairDStream<String, Integer> fwUptimeSum =  batchData.mapToPair(
+                new PairFunction<DataInputProtos.BatchPeriodicDataWorker, String, Integer>() {
+                    @Override
+                    public Tuple2<String, Integer> call(DataInputProtos.BatchPeriodicDataWorker batchPeriodicDataWorker) throws Exception {
+                        return new Tuple2<>(batchPeriodicDataWorker.getFirmwareTopVersion(), batchPeriodicDataWorker.getUptimeInSecond());
+                    }
+                }
+        ).reduceByKey(
+                new Function2<Integer, Integer, Integer>() {
+                    @Override
+                    public Integer call(Integer integer, Integer integer2) throws Exception {
+                        return (integer + integer2);
+                    }
+                }
+        );
+
+        // print first 10
         fwCounts.print();
-//
-//        // sum uptime per FW version
-//        JavaPairDStream<String, Integer> fwUptimeSum =  batchData.mapToPair(
-//                new PairFunction<DataInputProtos.BatchPeriodicDataWorker, String, Integer>() {
-//                    @Override
-//                    public Tuple2<String, Integer> call(DataInputProtos.BatchPeriodicDataWorker batchPeriodicDataWorker) throws Exception {
-//                        return new Tuple2<String, Integer>(batchPeriodicDataWorker.getFirmwareMiddleVersion(), batchPeriodicDataWorker.getUptimeInSecond());
-//                    }
-//                }
-//        ).reduceByKey(
-//                new Function2<Integer, Integer, Integer>() {
-//                    @Override
-//                    public Integer call(Integer integer, Integer integer2) throws Exception {
-//                        return (integer + integer2);
-//                    }
-//                }
-//        );
-//
-//        // print first 10
-//        fwCounts.print();
-//        fwUptimeSum.print();
+        fwUptimeSum.print();
 
         // Start the streaming context and await termination
         jssc.start();
