@@ -1,4 +1,4 @@
-package com.example;
+package com.hello.biggudeta.examples;
 
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
