@@ -1,12 +1,8 @@
 package com.hello.biggudeta.firmware;
 
-import com.amazonaws.ClientConfiguration;
 import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
-import com.amazonaws.regions.RegionUtils;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClient;
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
-import com.amazonaws.services.dynamodbv2.document.Item;
 import com.amazonaws.services.kinesis.AmazonKinesisClient;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -38,37 +34,33 @@ import java.util.List;
 public class SenseDataStreamProcessing {
     private static final Logger LOGGER = LoggerFactory.getLogger(SenseDataStreamProcessing.class);
 
-    private static DynamoDB getDynamoDBConnection() {
-        final ClientConfiguration clientConfiguration = new ClientConfiguration();
-        clientConfiguration.setMaxErrorRetry(3);
+    private static PairFunction<Tuple2<String, Iterable<FirmwareStreamData>>, String, FirmwareAnalytics> PROCESS_DATA =
+            tuple -> {
+                final String fwVersion = tuple._1();
+                int counts = 0;
+                int sum = 0;
+                int minUptime = Integer.MAX_VALUE;
+                int maxUptime = Integer.MIN_VALUE;
+                long maxTimestamp = Long.MIN_VALUE;
+                for (FirmwareStreamData streamData : tuple._2()) {
+                    sum += streamData.upTime;
+                    counts++;
+                    if (streamData.upTime < minUptime) { minUptime = streamData.upTime; }
+                    if (streamData.upTime > maxUptime) { maxUptime = streamData.upTime; }
+                    if (streamData.timestampMillis > maxTimestamp) { maxTimestamp = streamData.timestampMillis; }
+                }
+                final int average = (int) ((float) sum/counts);
+                final DateTime date = new DateTime(maxTimestamp, DateTimeZone.UTC);
+                return new Tuple2<>(fwVersion, new FirmwareAnalytics(fwVersion, date, counts, minUptime, maxUptime, average));
+            };
 
-        final AmazonDynamoDBClient dynamoDBClient = new AmazonDynamoDBClient(new DefaultAWSCredentialsProviderChain(), clientConfiguration);
-        dynamoDBClient.setEndpoint("http://dynamodb.us-east-1.amazonaws.com");
-
-        return new DynamoDB(dynamoDBClient);
-    }
-
-    private static void writeToDynamoDB(final FirmwareAnalytics data, final DateTime updated, final DynamoDB dynamoDB, final String tableName) {
-        final Item ddbItem = new Item()
-                .withPrimaryKey("fw_version", data.firmwareVersion,
-                        "datetime", data.dateTime.toString("yyyy-MM-dd HH:mm:ss"))
-                .withInt("counts", data.counts)
-                .withInt("avg_uptime", data.avgUpTime)
-                .withInt("min_uptime", data.minUpTime)
-                .withInt("max_uptime", data.maxUptime)
-                .withString("updated", updated.toString());
-
-        dynamoDB.getTable(tableName).putItem(ddbItem);
-    }
 
     public static void main(String[] args) {
-
-        final String configurationFile = args[0];
 
         ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
         SenseDataStreamConfiguration configuration = new SenseDataStreamConfiguration();
         try {
-            configuration = mapper.readValue(new File(configurationFile), SenseDataStreamConfiguration.class);
+            configuration = mapper.readValue(new File(args[0]), SenseDataStreamConfiguration.class);
         } catch (IOException e) {
             LOGGER.error("action=read-configuration error=something-wrong-aborting");
             e.printStackTrace();
@@ -82,18 +74,9 @@ public class SenseDataStreamProcessing {
         final String kinesisEndpoint = configuration.getKinesisConfiguration().getEndpoint();
         kinesisClient.setEndpoint(kinesisEndpoint);
 
-        final int numShards = kinesisClient.describeStream(configuration.getKinesisConfiguration().getStreamName()).getStreamDescription().getShards().size();
-        final int numStreams = numShards;
+        final int numStreams = kinesisClient.describeStream(configuration.getKinesisConfiguration().getStreamName()).getStreamDescription().getShards().size();
 
         final Duration batchInterval = new Duration(configuration.getSparkConfiguration().getBatchIntervalMillis());
-
-        final Duration kinesisCheckpointInterval = batchInterval;
-
-
-        // Get the region name from the endpoint URL to save Kinesis Client Library metadata in
-        // DynamoDB of the same region as Kinesis stream
-        final String regionName = RegionUtils.getRegionByEndpoint(kinesisEndpoint).getName();
-
 
         // set up Spark Context
         SparkConf sparkConfig = new SparkConf()
@@ -111,9 +94,9 @@ public class SenseDataStreamProcessing {
                             configuration.getKinesisConfiguration().getAppName(),
                             configuration.getKinesisConfiguration().getStreamName(),
                             kinesisEndpoint,
-                            regionName,
+                            configuration.getKinesisConfiguration().getRegion(),
                             InitialPositionInStream.LATEST,
-                            kinesisCheckpointInterval,
+                            batchInterval, // kinesis checkpoint interval
                             StorageLevel.MEMORY_ONLY())
             );
         }
@@ -141,47 +124,26 @@ public class SenseDataStreamProcessing {
                 }
         );
 
-        // Average uptimes per FW-version
+        // Average uptime per FW-version
         JavaPairDStream<String, Iterable<FirmwareStreamData>> uptimeGroupByFW = fwUptimeTuple.groupByKey();
 
-        JavaPairDStream<String, FirmwareAnalytics> averageUptime = uptimeGroupByFW.mapToPair(
-                new PairFunction<Tuple2<String, Iterable<FirmwareStreamData>>, String, FirmwareAnalytics>() {
-                    @Override
-                    public Tuple2<String, FirmwareAnalytics> call(Tuple2<String, Iterable<FirmwareStreamData>> tuple) throws Exception {
-                        final String fwVersion = tuple._1();
-                        int counts = 0;
-                        int sum = 0;
-                        int minUptime = Integer.MAX_VALUE;
-                        int maxUptime = Integer.MIN_VALUE;
-                        long maxTimestamp = Long.MIN_VALUE;
-                        for (FirmwareStreamData streamData : tuple._2()) {
-                            sum += streamData.upTime;
-                            counts++;
-                            if (streamData.upTime < minUptime) { minUptime = streamData.upTime; }
-                            if (streamData.upTime > maxUptime) { maxUptime = streamData.upTime; }
-                            if (streamData.timestampMillis > maxTimestamp) { maxTimestamp = streamData.timestampMillis; }
-                        }
-                        final int average = (int) ((float) sum/counts);
-                        final DateTime date = new DateTime(maxTimestamp, DateTimeZone.UTC);
-                        return new Tuple2<>(fwVersion, new FirmwareAnalytics(fwVersion, date, counts, minUptime, maxUptime, average));
-                    }
-                }
-        );
+        // compute min, max and average
+        JavaPairDStream<String, FirmwareAnalytics> averageUptime = uptimeGroupByFW.mapToPair(PROCESS_DATA);
 
-//        uptimeGroupByFW.print();
-//        averageUptimeByFW.print();
+        // print something
+        averageUptime.print();
 
         // save data to dynamo
-        final String dynamoDBTable = configuration.getDynamoDBConfiguration().getTableName();
+        String dynamoDBTable = configuration.getDynamoDBConfiguration().getTableName();
         averageUptime.foreachRDD(rdd -> {
 
             rdd.foreachPartition(partitionRecord -> {
 
-                DynamoDB dynamoDB = getDynamoDBConnection();
+                final DynamoDB dynamoDB = FirmwareAnalyticsDAODynamoDB.getDynamoDBConnection();
 
                 partitionRecord.forEachRemaining(record -> {
                     final DateTime now = DateTime.now(DateTimeZone.UTC);
-                    writeToDynamoDB(record._2(), now, dynamoDB, dynamoDBTable);
+                    FirmwareAnalyticsDAODynamoDB.writeToDynamoDB(record._2(), now, dynamoDB, dynamoDBTable);
                     System.out.println("Now: " + now + "Data: " + record._2().toString());
                 });
 
