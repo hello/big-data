@@ -10,11 +10,16 @@ import java.io.Serializable;
 public class FirmwareStreamData implements Serializable{
     public final String firmwareVersion;
     public final Integer upTime;
+    public final String deviceId;
+    public final String dateTime;
     public final Long timestampMillis;
 
-    public FirmwareStreamData(final String firmwareVersion, final Integer upTime, final Long timestampMillis) {
+    public FirmwareStreamData(final String firmwareVersion, final Integer upTime,
+                              final String deviceId, final String dateTime, final Long timestampMillis) {
         this.firmwareVersion = firmwareVersion;
         this.upTime = upTime;
+        this.deviceId = deviceId;
+        this.dateTime = dateTime;
         this.timestampMillis = timestampMillis;
     }
 

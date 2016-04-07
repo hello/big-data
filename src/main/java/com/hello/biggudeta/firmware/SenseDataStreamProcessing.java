@@ -1,15 +1,14 @@
 package com.hello.biggudeta.firmware;
 
-import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
 import com.amazonaws.services.kinesis.AmazonKinesisClient;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.google.common.collect.Maps;
 import com.hello.suripu.api.input.DataInputProtos;
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.api.java.JavaDStream;
@@ -27,6 +26,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Created by ksg on 3/24/16
@@ -34,43 +34,22 @@ import java.util.List;
 public class SenseDataStreamProcessing {
     private static final Logger LOGGER = LoggerFactory.getLogger(SenseDataStreamProcessing.class);
 
-    private static PairFunction<Tuple2<String, Iterable<FirmwareStreamData>>, String, FirmwareAnalytics> PROCESS_DATA =
-            tuple -> {
-                final String fwVersion = tuple._1();
-                int counts = 0;
-                int sum = 0;
-                int minUptime = Integer.MAX_VALUE;
-                int maxUptime = Integer.MIN_VALUE;
-                long maxTimestamp = Long.MIN_VALUE;
-                for (FirmwareStreamData streamData : tuple._2()) {
-                    sum += streamData.upTime;
-                    counts++;
-                    if (streamData.upTime < minUptime) { minUptime = streamData.upTime; }
-                    if (streamData.upTime > maxUptime) { maxUptime = streamData.upTime; }
-                    if (streamData.timestampMillis > maxTimestamp) { maxTimestamp = streamData.timestampMillis; }
-                }
-                final int average = (int) ((float) sum/counts);
-                final DateTime date = new DateTime(maxTimestamp, DateTimeZone.UTC);
-                return new Tuple2<>(fwVersion, new FirmwareAnalytics(fwVersion, date, counts, minUptime, maxUptime, average));
-            };
-
 
     public static void main(String[] args) {
 
+        // Read configuration file
         ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
         SenseDataStreamConfiguration configuration = new SenseDataStreamConfiguration();
+
         try {
             configuration = mapper.readValue(new File(args[0]), SenseDataStreamConfiguration.class);
         } catch (IOException e) {
-            LOGGER.error("action=read-configuration error=something-wrong-aborting");
-            e.printStackTrace();
+            LOGGER.error("action=read-configuration error=something-wrong-aborting msg={}", e.getMessage());
             System.exit(1);
         }
 
-        final AWSCredentialsProvider awsCredentialsProvider = new DefaultAWSCredentialsProviderChain();
-
         // setup Kinesis
-        final AmazonKinesisClient kinesisClient = new AmazonKinesisClient(awsCredentialsProvider);
+        final AmazonKinesisClient kinesisClient = new AmazonKinesisClient(new DefaultAWSCredentialsProviderChain());
         final String kinesisEndpoint = configuration.getKinesisConfiguration().getEndpoint();
         kinesisClient.setEndpoint(kinesisEndpoint);
 
@@ -103,6 +82,7 @@ public class SenseDataStreamProcessing {
 
         // start processing
 
+
         // union the streams
         final JavaDStream<byte[]> unionStreams;
         if (streamsList.size() > 1) {
@@ -119,16 +99,36 @@ public class SenseDataStreamProcessing {
         JavaPairDStream<String, FirmwareStreamData> fwUptimeTuple =  batchData.mapToPair(
                 data -> {
                     final String fwVersion = String.format("%s_%s", data.getFirmwareMiddleVersion(), data.getFirmwareTopVersion());
-                    return new Tuple2<>(fwVersion,
-                            new FirmwareStreamData(fwVersion, data.getUptimeInSecond(), data.getReceivedAt()));
+                    final DateTime receivedDT = new DateTime(data.getReceivedAt(), DateTimeZone.UTC);
+//                    final int receivedSecs = receivedDT.getSecondOfMinute();
+//                    final int setSeconds = (receivedSecs >= 30) ? 30 : 0;
+                    final String dateTime = receivedDT.withSecondOfMinute(0).toString("yyyy-MM-dd HH:mm");
+                    final String keyString = String.format("%s | %s", dateTime, fwVersion);
+                    return new Tuple2<>(keyString,
+                            new FirmwareStreamData(fwVersion, data.getUptimeInSecond(), data.getData().getDeviceId(), dateTime, data.getReceivedAt()));
                 }
         );
 
         // Average uptime per FW-version
-        JavaPairDStream<String, Iterable<FirmwareStreamData>> uptimeGroupByFW = fwUptimeTuple.groupByKey();
+        JavaPairDStream<String, Iterable<FirmwareStreamData>> uptimeGroupByDateTime = fwUptimeTuple.groupByKey();
+
+        // get unique device-ids, latest protobuf message
+        JavaPairDStream<String, Iterable<FirmwareStreamData>> aggregate = uptimeGroupByDateTime.mapValues(values -> {
+            final Map<String, FirmwareStreamData> finalSet = Maps.newHashMap();
+            int counts = 0;
+            for (FirmwareStreamData data : values) {
+                final String deviceId = data.deviceId;
+                finalSet.put(deviceId, data);
+                counts++;
+            }
+            System.out.println("original: " + counts + " final: " + finalSet.size());
+            return finalSet.values();
+        });
+
 
         // compute min, max and average
-        JavaPairDStream<String, FirmwareAnalytics> averageUptime = uptimeGroupByFW.mapToPair(PROCESS_DATA);
+        JavaPairDStream<String, FirmwareAnalytics> averageUptime = aggregate.mapToPair(FirmwareAnalyticsUtils.PROCESS_DATA);
+
 
         // print something
         averageUptime.print();

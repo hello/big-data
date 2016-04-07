@@ -1,15 +1,15 @@
 
 spark:
-  streaming_app_name: SenseDataKinesisProcessing
+  streaming_app_name: SenseDataStreamProcessing
   master: local[4]
-  batch_interval_millis: 10000 # 10 secs
+  batch_interval_millis: 120000 # 2 minutes
   checkpoint_directory: "/tmp/spark-checkpoint"
 
 
 kinesis:
-  stream_name: dev_sense_sensors_data
+  stream_name: sense_sensors_data
   endpoint: https://kinesis.us-east-1.amazonaws.com
-  app_name: SenseSaveConsumerDevDDBKSG_2
+  app_name: SenseDataSparkStreamDev
   region: us-east-1
 
 dynamodb:
