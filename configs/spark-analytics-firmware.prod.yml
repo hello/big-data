@@ -1,0 +1,19 @@
+
+spark:
+  streaming_app_name: SparkAnalyticsFirmwareProd
+  master: local[4]
+  batch_interval_millis: 20000 # 10 secs
+  window_size_millis: 60000 # 1 minute
+  checkpoint_directory: "/tmp/spark-firmware-checkpoint"
+
+
+kinesis:
+  stream_name: sense_sensors_data
+  endpoint: https://kinesis.us-east-1.amazonaws.com
+  app_name: SparkAnalyticsFirmwareConsumerProd
+  region: us-east-1
+
+dynamodb:
+  region: us-east-1
+  endpoint: http://dynamodb.us-east-1.amazonaws.com
+  table_name: prod_spark_analytics_firmware
