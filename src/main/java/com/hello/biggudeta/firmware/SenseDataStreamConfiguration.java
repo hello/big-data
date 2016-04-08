@@ -25,6 +25,10 @@ public class SenseDataStreamConfiguration {
         private String checkpointDirectory;
         public String getCheckpointDirectory() { return  checkpointDirectory; }
 
+        @JsonProperty("window_size_millis")
+        private long windowSizeMillis;
+        public long getWindowSizeMillis() { return windowSizeMillis; }
+
         public SparkConfiguration() {}
     }
 

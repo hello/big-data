@@ -2,13 +2,15 @@ package com.hello.biggudeta.firmware;
 
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
+import com.amazonaws.services.dynamodbv2.document.Table;
 import com.amazonaws.services.kinesis.AmazonKinesisClient;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
-import com.google.common.collect.Maps;
 import com.hello.suripu.api.input.DataInputProtos;
 import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.function.Function;
 import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.api.java.JavaDStream;
@@ -26,7 +28,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Created by ksg on 3/24/16
@@ -53,14 +54,19 @@ public class SenseDataStreamProcessing {
         final String kinesisEndpoint = configuration.getKinesisConfiguration().getEndpoint();
         kinesisClient.setEndpoint(kinesisEndpoint);
 
-        final int numStreams = kinesisClient.describeStream(configuration.getKinesisConfiguration().getStreamName()).getStreamDescription().getShards().size();
-
-        final Duration batchInterval = new Duration(configuration.getSparkConfiguration().getBatchIntervalMillis());
+        final String kinesisStreamName = configuration.getKinesisConfiguration().getStreamName();
+        final int numStreams = kinesisClient.describeStream(kinesisStreamName).getStreamDescription().getShards().size();
 
         // set up Spark Context
         SparkConf sparkConfig = new SparkConf()
                 .setMaster(configuration.getSparkConfiguration().getMasterConfig())
                 .setAppName(configuration.getSparkConfiguration().getAppName());
+
+        // Receiver batch Interval
+        final Duration batchInterval = new Duration(configuration.getSparkConfiguration().getBatchIntervalMillis());
+
+        // accumulate a 1 minute non-overlapping window of data before processing
+        final Duration windowSize = new Duration(configuration.getSparkConfiguration().getWindowSizeMillis());
 
         JavaStreamingContext jssc = new JavaStreamingContext(sparkConfig, batchInterval);
         jssc.checkpoint(configuration.getSparkConfiguration().getCheckpointDirectory());
@@ -82,8 +88,7 @@ public class SenseDataStreamProcessing {
 
         // start processing
 
-
-        // union the streams
+        // union the streams from shards
         final JavaDStream<byte[]> unionStreams;
         if (streamsList.size() > 1) {
             unionStreams = jssc.union(streamsList.get(0), streamsList.subList(1, streamsList.size()));
@@ -91,60 +96,74 @@ public class SenseDataStreamProcessing {
             unionStreams = streamsList.get(0);
         }
 
+
         // convert each stream to DataInputProtos.BatchPeriodicDataWorker
         JavaDStream<DataInputProtos.BatchPeriodicDataWorker> batchData = unionStreams.flatMap(
                 bytes -> Arrays.asList(DataInputProtos.BatchPeriodicDataWorker.parseFrom(bytes)));
 
-        // Create batches of <FW-version, uptime>
-        JavaPairDStream<String, FirmwareStreamData> fwUptimeTuple =  batchData.mapToPair(
+
+        // accumulate larger window of data
+        JavaDStream<DataInputProtos.BatchPeriodicDataWorker> windowData = batchData.window(windowSize, windowSize);
+
+
+        // look into each DStream RDD and only save unique data
+        JavaDStream<DataInputProtos.BatchPeriodicDataWorker> distinctData = windowData.transform(
+                (Function<JavaRDD<DataInputProtos.BatchPeriodicDataWorker>, JavaRDD<DataInputProtos.BatchPeriodicDataWorker>>) JavaRDD::distinct);
+
+
+        // Create batches of <"date | middle_top-version", FirmwareStreamData>
+        JavaPairDStream<String, FirmwareStreamData> fwUptimeTuple = distinctData.mapToPair(
                 data -> {
                     final String fwVersion = String.format("%s_%s", data.getFirmwareMiddleVersion(), data.getFirmwareTopVersion());
                     final DateTime receivedDT = new DateTime(data.getReceivedAt(), DateTimeZone.UTC);
-//                    final int receivedSecs = receivedDT.getSecondOfMinute();
-//                    final int setSeconds = (receivedSecs >= 30) ? 30 : 0;
                     final String dateTime = receivedDT.withSecondOfMinute(0).toString("yyyy-MM-dd HH:mm");
                     final String keyString = String.format("%s | %s", dateTime, fwVersion);
+
+                    // debugging
+                    if (fwVersion.equalsIgnoreCase("FB7_1.0.3")) {
+                        System.out.println("bucket: " + keyString + "  recvd: " + receivedDT.toString() +
+                                "  uptime: " + data.getUptimeInSecond() + "  device: " + data.getData().getDeviceId());
+                    }
+
                     return new Tuple2<>(keyString,
                             new FirmwareStreamData(fwVersion, data.getUptimeInSecond(), data.getData().getDeviceId(), dateTime, data.getReceivedAt()));
                 }
         );
 
+
         // Average uptime per FW-version
         JavaPairDStream<String, Iterable<FirmwareStreamData>> uptimeGroupByDateTime = fwUptimeTuple.groupByKey();
 
-        // get unique device-ids, latest protobuf message
-        JavaPairDStream<String, Iterable<FirmwareStreamData>> aggregate = uptimeGroupByDateTime.mapValues(values -> {
-            final Map<String, FirmwareStreamData> finalSet = Maps.newHashMap();
-            int counts = 0;
-            for (FirmwareStreamData data : values) {
-                final String deviceId = data.deviceId;
-                finalSet.put(deviceId, data);
-                counts++;
-            }
-            System.out.println("original: " + counts + " final: " + finalSet.size());
-            return finalSet.values();
-        });
-
 
         // compute min, max and average
-        JavaPairDStream<String, FirmwareAnalytics> averageUptime = aggregate.mapToPair(FirmwareAnalyticsUtils.PROCESS_DATA);
+        JavaPairDStream<String, FirmwareAnalytics> averageUptime = uptimeGroupByDateTime.mapToPair(FirmwareAnalyticsUtils.PROCESS_DATA);
 
 
         // print something
         averageUptime.print();
 
+
         // save data to dynamo
-        String dynamoDBTable = configuration.getDynamoDBConfiguration().getTableName();
+        final String dynamoDBTableName = configuration.getDynamoDBConfiguration().getTableName();
+        final String dynamoEndpoint = configuration.getDynamoDBConfiguration().getEndpoint();
         averageUptime.foreachRDD(rdd -> {
 
             rdd.foreachPartition(partitionRecord -> {
 
-                final DynamoDB dynamoDB = FirmwareAnalyticsDAODynamoDB.getDynamoDBConnection();
+                // TODO: create connection pool
+                final DynamoDB dynamoDB = FirmwareAnalyticsDAODynamoDB.getDynamoDBConnection(dynamoEndpoint);
+                final Table dynamoDBTable = dynamoDB.getTable(dynamoDBTableName);
 
                 partitionRecord.forEachRemaining(record -> {
                     final DateTime now = DateTime.now(DateTimeZone.UTC);
-                    FirmwareAnalyticsDAODynamoDB.writeToDynamoDB(record._2(), now, dynamoDB, dynamoDBTable);
-                    System.out.println("Now: " + now + "Data: " + record._2().toString());
+                    final FirmwareAnalytics analytics = record._2();
+
+                    FirmwareAnalyticsDAODynamoDB.writeToDynamoDB(analytics, now, dynamoDBTable);
+
+//                    // debugging. current main version is F34_1.0.3
+//                    if (analytics.buckString.contains("FB7_1.0.3")) {
+//                        System.out.println("Now: " + now + "Data: " + analytics.toString());
+//                    }
                 });
 
             });

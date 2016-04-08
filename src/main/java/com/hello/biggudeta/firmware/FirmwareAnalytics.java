@@ -23,7 +23,9 @@ public class FirmwareAnalytics implements Serializable {
                              final DateTime batchEndTime,
                              final Integer counts,
                              final Long totalUptime,
-                             final Integer minUpTime, final Integer maxUptime, final Integer avgUpTime) {
+                             final Integer minUpTime,
+                             final Integer maxUptime,
+                             final Integer avgUpTime) {
         this.buckString = buckString;
         this.batchStartTime = batchStartTime;
         this.batchEndTime = batchEndTime;
