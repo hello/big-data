@@ -8,7 +8,7 @@ spark:
 
 
 kinesis:
-  stream_name: dev_sense_sensors_data_fanout_one
+  stream_name: sense_sensors_data_fanout_one
   endpoint: https://kinesis.us-east-1.amazonaws.com
   app_name: SparkAnalyticsFirmwareConsumerDevKSG
   region: us-east-1

@@ -120,7 +120,7 @@ public class SenseDataStreamProcessing {
                     final String keyString = String.format("%s | %s", dateTime, fwVersion);
 
                     // debugging
-                    if (fwVersion.equalsIgnoreCase("FB7_1.0.3")) {
+                    if (fwVersion.equalsIgnoreCase("FB8_1.0.3")) {
                         System.out.println("bucket: " + keyString + "  recvd: " + receivedDT.toString() +
                                 "  uptime: " + data.getUptimeInSecond() + "  device: " + data.getData().getDeviceId());
                     }
